@@ -1,0 +1,159 @@
+---
+title: "Behaviour Transitions and Metabolic Change in a 3-Year Health Check-Up Cohort"
+author: "Matthew Anson, Jędrzej Chrzanowski, Lisa den Brook, Michał Kulecki"
+date: "3/20/2026"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+required_packages <- c("dplyr", "readr", "knitr", "scales")
+
+ensure_packages <- function(packages) {
+  missing_packages <- packages[!vapply(packages, requireNamespace, logical(1), quietly = TRUE)]
+  if (length(missing_packages) > 0) {
+    install.packages(missing_packages, repos = "https://cloud.r-project.org")
+  }
+
+  invisible(lapply(packages, library, character.only = TRUE))
+}
+
+ensure_packages(required_packages)
+
+knitr::opts_chunk$set(
+  echo = FALSE,
+  message = FALSE,
+  warning = FALSE,
+  fig.align = "center",
+  out.width = "95%"
+)
+
+locate_project_dir <- function() {
+  candidates <- c(".", "..", "../..", "../../..")
+
+  for (candidate in candidates) {
+    if (
+      file.exists(file.path(candidate, "lifestyledata.csv")) &&
+      file.exists(file.path(candidate, "transition_focus_workflow.R"))
+    ) {
+      return(normalizePath(candidate))
+    }
+  }
+
+  stop("Could not locate the project root.")
+}
+
+project_dir <- locate_project_dir()
+report_dir <- file.path(project_dir, "analysis_output", "transition_focus")
+plot_dir <- file.path(report_dir, "plots")
+
+patient_flow <- readr::read_csv(file.path(report_dir, "patient_flow_summary.csv"), show_col_types = FALSE)
+entry_characteristics <- readr::read_csv(file.path(report_dir, "first_timepoint_clinical_characteristics.csv"), show_col_types = FALSE)
+metabolic_models <- readr::read_csv(file.path(report_dir, "metabolic_change_models.csv"), show_col_types = FALSE)
+forest_top_results <- readr::read_csv(file.path(report_dir, "forest_top_results.csv"), show_col_types = FALSE)
+pair_data <- readr::read_csv(file.path(report_dir, "patient_level_behaviour_transition_pairs.csv"), show_col_types = FALSE)
+
+count_metric <- function(label) {
+  patient_flow$n[patient_flow$metric == label][1]
+}
+
+direction_counts <- pair_data |>
+  dplyr::group_by(behaviour_label, transition, change_direction) |>
+  dplyr::summarise(n = dplyr::n(), .groups = "drop") |>
+  dplyr::group_by(behaviour_label, transition) |>
+  dplyr::mutate(pct = 100 * n / sum(n)) |>
+  dplyr::ungroup()
+
+quick_no_change_t2_t3 <- direction_counts |>
+  dplyr::filter(
+    behaviour_label == "Quick eating",
+    transition == "T2_to_T3",
+    change_direction == "No change"
+  ) |>
+  dplyr::pull(pct)
+
+breakfast_no_change_t2_t3 <- direction_counts |>
+  dplyr::filter(
+    behaviour_label == "Skipping breakfast",
+    transition == "T2_to_T3",
+    change_direction == "No change"
+  ) |>
+  dplyr::pull(pct)
+
+key_results <- metabolic_models |>
+  dplyr::filter(p.value < 0.05, n >= 100) |>
+  dplyr::mutate(
+    estimate = round(estimate, 3),
+    conf.low = round(conf.low, 3),
+    conf.high = round(conf.high, 3),
+    std_estimate = round(std_estimate, 3),
+    p.value = round(p.value, 4)
+  ) |>
+  dplyr::select(
+    outcome_label,
+    behaviour_label,
+    transition,
+    comparison,
+    estimate,
+    conf.low,
+    conf.high,
+    std_estimate,
+    p.value,
+    n
+  ) |>
+  dplyr::arrange(p.value)
+```
+
+# Overview
+
+This proof-of-concept report refocuses the re-analysis on cohort entry, behaviour-pattern transitions, and metabolic change. Source publication is available at 10.1136/bmjnph-2018-000011. This re-analysis does not represent perspective of initial or current authors, and is intended only as exemplary tutorial material. Baseline logistic and linear HbA1c prediction models were intentionally dropped. Instead, the analysis starts from the raw files, tracks who entered at each annual timepoint, visualises behaviour transitions with Sankey plots, and fits adjusted change models for HbA1c, BMI, waist circumference, HDL, LDL, and log triglyceride.
+
+# Cohort Flow
+
+The raw dataset contained `r scales::comma(count_metric("Unique patients"))` unique patients. Of these, `r scales::comma(count_metric("Started at T1"))` first appeared at T1, `r scales::comma(count_metric("Started at T2"))` entered at T2, and `r scales::comma(count_metric("Started at T3"))` entered at T3. Among T1 starters, `r scales::comma(count_metric("T1 patients observed again at T2"))` were also observed at T2 and `r scales::comma(count_metric("T1 patients observed again at T3"))` were also observed at T3. Among patients who entered at T2, `r scales::comma(count_metric("T2 entrants observed again at T3"))` were seen again at T3.
+
+```{r fig-flow}
+knitr::include_graphics(file.path(plot_dir, "patient_flowchart.png"))
+```
+
+```{r entry-table}
+knitr::kable(
+  entry_characteristics,
+  caption = "Clinical characteristics at each patient's first observed timepoint."
+)
+```
+
+# Behaviour Transitions
+
+Across transitions, most participants did not change the binary behaviour variables, whereas quick eating was meaningfully more dynamic. For example, no change accounted for `r sprintf('%.1f', quick_no_change_t2_t3)`% of quick-eating transitions from T2 to T3, compared with `r sprintf('%.1f', breakfast_no_change_t2_t3)`% for skipping breakfast over the same interval.
+
+```{r fig-sankeys, fig.show='hold', out.width='49%'}
+knitr::include_graphics(c(
+  file.path(plot_dir, "sankey_quick_eating_category.png"),
+  file.path(plot_dir, "sankey_eating_within_2_hr_before_bed_category.png"),
+  file.path(plot_dir, "sankey_midnight_snack_category.png"),
+  file.path(plot_dir, "sankey_skipping_breakfast_category.png")
+))
+```
+
+# Adjusted Change Models
+
+The transition models adjusted for baseline outcome level, age, sex, smoking, alcohol drinking, exercise, medication use, cohort entry timepoint, and baseline BMI and/or HbA1c where appropriate. The clearest and most coherent pattern was seen for adiposity: worsening breakfast skipping and worsening eating within 2 hours before bed were associated with BMI and waist gain, especially in the later transition windows. HbA1c signals were weaker and less consistent, while several lipid findings were statistically notable but directionally mixed and should be treated as exploratory.
+
+```{r key-results-table}
+knitr::kable(
+  key_results,
+  caption = "Adjusted behaviour-change associations with p < 0.05 and model n >= 100."
+)
+```
+
+```{r fig-forest}
+knitr::include_graphics(file.path(plot_dir, "forest_top_results.png"))
+```
+
+# Take-Home Point
+
+This transition-focused re-analysis suggests that behaviour change in this cohort is more visibly reflected in BMI and waist trajectories than in HbA1c itself. The most stable behaviours were the binary late-eating and breakfast variables, while quick eating showed more movement over time. The strongest adjusted signals were adiposity-related, particularly for worsening breakfast skipping and worsening eating close to bedtime.

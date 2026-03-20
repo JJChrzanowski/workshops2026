@@ -1,0 +1,1093 @@
+---
+title: "Behaviour Transitions and Metabolic Change in a 3-Year Health Check-Up Cohort"
+author: "Matthew Anson, Jędrzej Chrzanowski, Lisa den Brook, Michał Kulecki"
+date: "3/20/2026"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+    code_folding: hide
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+locate_project_dir <- function() {
+  candidates <- c(".", "..", "../..", "../../..")
+
+  for (candidate in candidates) {
+    if (
+      file.exists(file.path(candidate, "lifestyledata.csv")) &&
+      file.exists(file.path(candidate, "transition_focus_workflow.R"))
+    ) {
+      return(normalizePath(candidate))
+    }
+  }
+
+  stop("Could not locate the project root.")
+}
+
+project_dir <- locate_project_dir()
+lib_dir <- file.path(project_dir, "analysis_output", "behaviour_change", "r_libs")
+
+if (dir.exists(lib_dir)) {
+  .libPaths(c(lib_dir, .libPaths()))
+}
+
+analysis_packages <- c(
+  "dplyr",
+  "tidyr",
+  "readr",
+  "readxl",
+  "janitor",
+  "ggplot2",
+  "ggalluvial",
+  "broom",
+  "purrr",
+  "sandwich",
+  "lmtest",
+  "forcats",
+  "stringr",
+  "tibble",
+  "scales",
+  "grid"
+)
+
+ensure_packages <- function(packages) {
+  missing_packages <- packages[!vapply(packages, requireNamespace, logical(1), quietly = TRUE)]
+
+  if (length(missing_packages) > 0) {
+    install.packages(missing_packages, repos = "https://cloud.r-project.org")
+  }
+
+  invisible(lapply(packages, library, character.only = TRUE))
+}
+
+ensure_packages(analysis_packages)
+
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  fig.align = "center",
+  out.width = "95%"
+)
+
+theme_set(theme_minimal(base_size = 12))
+
+csv_path <- file.path(project_dir, "lifestyledata.csv")
+xlsx_path <- file.path(project_dir, "lifestyle dataset.xlsx")
+output_dir <- file.path(project_dir, "analysis_output", "transition_focus")
+plot_dir <- file.path(output_dir, "plots")
+```
+
+# Introduction
+
+Source publication is available at 10.1136/bmjnph-2018-000011. This re-analysis does not represent perspective of initial or current authors, and is intended only as exemplary tutorial material. 
+
+The paper by Maw and Haga examined whether eating dinner within two hours of bedtime affected HbA1c in middle-aged and older Japanese adults. Its headline conclusion was largely negative for the dinner-to-bed exposure. That result does not rule out the possibility that behaviour change itself, rather than baseline behaviour status, may be more informative for metabolic trajectories.
+
+The dataset also has a non-trivial cohort-entry structure: not all patients begin at T1, and a substantial number enter at T2 or T3. This matters for both description and inference. The present report therefore reframes the analysis around four goals:
+
+1. describe raw patient flow across T1, T2, and T3;
+2. summarise clinical characteristics at each patient's first observed timepoint;
+3. visualise behaviour-pattern transitions with Sankey plots; and
+4. model metabolic change as a function of behaviour change, with clinical adjustment.
+
+# Methods
+
+## Data Source
+
+The raw files are `lifestyledata.csv` and `lifestyle dataset.xlsx` in the project root. The underlying study was described in Maw SS, Haga C. *Effect of a 2-hour interval between dinner and bedtime on glycated haemoglobin levels in middle-aged and elderly Japanese people: a longitudinal analysis of 3-year health check-up data*. BMJ Nutrition, Prevention & Health. 2019;2:1-10. doi:10.1136/bmjnph-2018-000011.
+
+## Reproducible Workflow
+
+The next chunk contains the complete executable analysis from raw files to final tables and figures.
+
+```{r full-pipeline, results='hide'}
+if (!dir.exists(output_dir)) {
+  dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+}
+
+if (!dir.exists(plot_dir)) {
+  dir.create(plot_dir, showWarnings = FALSE, recursive = TRUE)
+}
+
+if (!file.exists(csv_path) && !file.exists(xlsx_path)) {
+  stop("Could not locate raw input files.")
+}
+
+raw_data <- if (file.exists(csv_path)) {
+  readr::read_csv(csv_path, show_col_types = FALSE)
+} else {
+  readxl::read_excel(xlsx_path, sheet = "Data")
+}
+
+year_levels <- sort(unique(readr::parse_number(as.character(raw_data$`Year of data`))))
+time_labels <- paste0("T", seq_along(year_levels))
+
+numeric_like_vars <- c(
+  "sex",
+  "age",
+  "height",
+  "weight",
+  "waist_circumference_cm",
+  "bmi",
+  "fasting_blood_glucose",
+  "hb_a1c",
+  "triglyceride",
+  "hdl",
+  "ldl",
+  "systolic_bp",
+  "diastolic_bp",
+  "got",
+  "gpt",
+  "g_gtp",
+  "gtp",
+  "uric_acid",
+  "serum_creatinine",
+  "e_gfr",
+  "hematocrit",
+  "hemoglobin",
+  "smoking_status",
+  "healthgui_active",
+  "healthgui_motivation",
+  "taking_medication_for_hypertenstion",
+  "taking_medication_for_hyperlipidemia",
+  "taking_medication_for_diabetes",
+  "history_of_cardiovascular_diseases",
+  "history_of_dialysis",
+  "history_of_cerebrovascular_diseases",
+  "blood_pressure_category",
+  "triglyceride_category",
+  "hdl_category",
+  "ldl_category",
+  "gpt_category",
+  "g_gtp_category",
+  "hb_a1c_category",
+  "taking_health_care_from_doctor_category",
+  "phn_category",
+  "ci_category",
+  "care_category",
+  "presence_of_anemia_category",
+  "weight_changes_from_20_yr_category",
+  "exercise_more_than_30_minutes_category",
+  "walking_or_physical_activity_category",
+  "quick_walking_category",
+  "weight_changes_within_1_yr_category",
+  "quick_eating_category",
+  "eating_within_2_hr_before_bed_category",
+  "midnight_snack_category",
+  "skipping_breakfast_category",
+  "alcohol_drinking_category",
+  "alcohol_amount_category",
+  "enough_sleep",
+  "improve_lifestyle_habits",
+  "hope_for_health_guidance"
+)
+
+data_long <- raw_data |>
+  janitor::clean_names() |>
+  dplyr::mutate(dplyr::across(where(is.character), ~ na_if(stringr::str_squish(.x), ""))) |>
+  dplyr::mutate(dplyr::across(dplyr::any_of(numeric_like_vars), ~ readr::parse_number(as.character(.x)))) |>
+  dplyr::mutate(
+    patient_id = id_of_participants,
+    timepoint = factor(year_of_data, levels = year_levels, labels = time_labels),
+    timepoint_num = as.integer(timepoint),
+    hba1c = hb_a1c,
+    egfr = e_gfr,
+    sex = factor(sex, levels = c(0, 1), labels = c("Female", "Male")),
+    smoking_status = factor(smoking_status, levels = c(0, 1), labels = c("No", "Yes")),
+    dplyr::across(
+      dplyr::any_of(c(
+        "taking_medication_for_hypertenstion",
+        "taking_medication_for_hyperlipidemia",
+        "taking_medication_for_diabetes",
+        "history_of_cardiovascular_diseases",
+        "history_of_dialysis",
+        "history_of_cerebrovascular_diseases"
+      )),
+      ~ factor(.x, levels = c(0, 1), labels = c("No", "Yes"))
+    ),
+    quick_eating_category = factor(
+      quick_eating_category,
+      levels = c(1, 2, 3),
+      labels = c("Quick", "Normal", "Slow")
+    ),
+    eating_within_2_hr_before_bed_category = factor(
+      eating_within_2_hr_before_bed_category,
+      levels = c(1, 2),
+      labels = c("Yes", "No")
+    ),
+    midnight_snack_category = factor(
+      midnight_snack_category,
+      levels = c(1, 2),
+      labels = c("Yes", "No")
+    ),
+    skipping_breakfast_category = factor(
+      skipping_breakfast_category,
+      levels = c(1, 2),
+      labels = c("Yes", "No")
+    ),
+    alcohol_drinking_category = factor(
+      alcohol_drinking_category,
+      levels = c(1, 2, 3),
+      labels = c("Every day", "Sometimes", "No drinking")
+    ),
+    alcohol_amount_category = factor(
+      alcohol_amount_category,
+      levels = c(1, 2, 3, 4),
+      labels = c("<1 gou", "1-2 gou", "2-3 gou", ">=3 gou")
+    ),
+    enough_sleep = factor(
+      enough_sleep,
+      levels = c(1, 2),
+      labels = c("Yes", "No")
+    ),
+    improve_lifestyle_habits = factor(
+      improve_lifestyle_habits,
+      levels = c(1, 2, 3, 4, 5),
+      labels = c("No interest", "Interested", "Preparing", "Performing", "Maintaining")
+    ),
+    hope_for_health_guidance = factor(
+      hope_for_health_guidance,
+      levels = c(1, 2),
+      labels = c("Yes", "No")
+    ),
+    exercise_more_than_30_minutes_category = factor(
+      exercise_more_than_30_minutes_category,
+      levels = c(1, 2),
+      labels = c("Yes", "No")
+    ),
+    walking_or_physical_activity_category = factor(
+      walking_or_physical_activity_category,
+      levels = c(1, 2),
+      labels = c("Yes", "No")
+    ),
+    quick_walking_category = factor(
+      quick_walking_category,
+      levels = c(1, 2),
+      labels = c("Yes", "No")
+    ),
+    weight_changes_within_1_yr_category = factor(
+      weight_changes_within_1_yr_category,
+      levels = c(1, 2),
+      labels = c("Yes", "No")
+    ),
+    weight_changes_from_20_yr_category = factor(
+      weight_changes_from_20_yr_category,
+      levels = c(1, 2),
+      labels = c("Yes", "No")
+    ),
+    log_triglyceride = dplyr::if_else(!is.na(triglyceride) & triglyceride > 0, log(triglyceride), NA_real_)
+  ) |>
+  dplyr::arrange(patient_id, timepoint_num)
+
+readr::write_csv(
+  data_long,
+  file.path(output_dir, "lifestyle_clean_long_all_patients.csv")
+)
+
+behaviour_specs <- tibble::tribble(
+  ~behaviour, ~behaviour_label, ~behaviour_type,
+  "quick_eating_category", "Quick eating", "ordinal_quick",
+  "eating_within_2_hr_before_bed_category", "Eating within 2 hr before bed", "binary_risk",
+  "midnight_snack_category", "Midnight snack", "binary_risk",
+  "skipping_breakfast_category", "Skipping breakfast", "binary_risk"
+)
+
+outcome_specs <- tibble::tribble(
+  ~outcome, ~outcome_label,
+  "hba1c", "HbA1c",
+  "bmi", "BMI",
+  "waist_circumference_cm", "Waist circumference (cm)",
+  "hdl", "HDL",
+  "ldl", "LDL",
+  "log_triglyceride", "Log triglyceride"
+)
+
+transition_pairs <- tibble::tribble(
+  ~from_tp, ~to_tp, ~transition,
+  "T1", "T2", "T1_to_T2",
+  "T2", "T3", "T2_to_T3",
+  "T1", "T3", "T1_to_T3"
+)
+
+score_behaviour <- function(values, behaviour_type) {
+  if (behaviour_type == "ordinal_quick") {
+    dplyr::recode(values, "Quick" = 2, "Normal" = 1, "Slow" = 0, .default = NA_real_)
+  } else {
+    dplyr::recode(values, "Yes" = 1, "No" = 0, .default = NA_real_)
+  }
+}
+
+classify_change <- function(from_values, to_values, behaviour_type) {
+  from_score <- score_behaviour(from_values, behaviour_type)
+  to_score <- score_behaviour(to_values, behaviour_type)
+
+  dplyr::case_when(
+    is.na(from_score) | is.na(to_score) ~ NA_character_,
+    to_score < from_score ~ "Improved behaviour",
+    to_score > from_score ~ "Worsened behaviour",
+    TRUE ~ "No change"
+  )
+}
+
+fmt_mean_sd <- function(x, digits = 1) {
+  x <- x[!is.na(x)]
+
+  if (length(x) == 0) {
+    return(NA_character_)
+  }
+
+  sprintf(paste0("%.", digits, "f (%.", digits, "f)"), mean(x), stats::sd(x))
+}
+
+fmt_median_iqr <- function(x, digits = 1) {
+  x <- x[!is.na(x)]
+
+  if (length(x) == 0) {
+    return(NA_character_)
+  }
+
+  sprintf(
+    paste0("%.", digits, "f [%.", digits, "f, %.", digits, "f]"),
+    stats::median(x),
+    stats::quantile(x, 0.25),
+    stats::quantile(x, 0.75)
+  )
+}
+
+fmt_n_pct <- function(x, yes_label = "Yes", digits = 1) {
+  x <- x[!is.na(x)]
+
+  if (length(x) == 0) {
+    return(NA_character_)
+  }
+
+  n_yes <- sum(as.character(x) == yes_label)
+  sprintf("%d (%.1f%%)", n_yes, 100 * n_yes / length(x))
+}
+
+patient_presence <- data_long |>
+  dplyr::distinct(patient_id, timepoint) |>
+  dplyr::mutate(present = 1L) |>
+  tidyr::pivot_wider(
+    names_from = timepoint,
+    values_from = present,
+    values_fill = 0L
+  ) |>
+  dplyr::mutate(
+    first_timepoint = dplyr::case_when(
+      T1 == 1L ~ "T1",
+      T2 == 1L ~ "T2",
+      T3 == 1L ~ "T3",
+      TRUE ~ NA_character_
+    ),
+    visit_pattern = dplyr::case_when(
+      T1 == 1L & T2 == 1L & T3 == 1L ~ "T1 + T2 + T3",
+      T1 == 1L & T2 == 1L & T3 == 0L ~ "T1 + T2 only",
+      T1 == 1L & T2 == 0L & T3 == 1L ~ "T1 + T3 only",
+      T1 == 1L & T2 == 0L & T3 == 0L ~ "T1 only",
+      T1 == 0L & T2 == 1L & T3 == 1L ~ "T2 + T3 only",
+      T1 == 0L & T2 == 1L & T3 == 0L ~ "T2 only",
+      T1 == 0L & T2 == 0L & T3 == 1L ~ "T3 only",
+      TRUE ~ "Other"
+    )
+  )
+
+entry_lookup <- patient_presence |>
+  dplyr::select(patient_id, first_timepoint)
+
+patient_flow_summary <- tibble::tribble(
+  ~metric, ~n,
+  "Unique patients", nrow(patient_presence),
+  "Observed at T1", sum(patient_presence$T1),
+  "Observed at T2", sum(patient_presence$T2),
+  "Observed at T3", sum(patient_presence$T3),
+  "Started at T1", sum(patient_presence$first_timepoint == "T1"),
+  "Started at T2", sum(patient_presence$first_timepoint == "T2"),
+  "Started at T3", sum(patient_presence$first_timepoint == "T3"),
+  "T1 patients observed again at T2", sum(patient_presence$T1 == 1L & patient_presence$T2 == 1L),
+  "T1 patients observed again at T3", sum(patient_presence$T1 == 1L & patient_presence$T3 == 1L),
+  "T2 entrants observed again at T3", sum(patient_presence$T1 == 0L & patient_presence$T2 == 1L & patient_presence$T3 == 1L),
+  "Observed at all three timepoints", sum(patient_presence$T1 == 1L & patient_presence$T2 == 1L & patient_presence$T3 == 1L)
+)
+
+readr::write_csv(
+  patient_flow_summary,
+  file.path(output_dir, "patient_flow_summary.csv")
+)
+
+readr::write_csv(
+  patient_presence,
+  file.path(output_dir, "patient_presence_patterns.csv")
+)
+
+flow_nodes <- tibble::tribble(
+  ~node_id, ~x, ~y, ~label, ~fill_group,
+  "all", 0.8, 0.62, paste0("Unique patients\nn = ", nrow(patient_presence)), "all",
+  "t1", 2.6, 0.82, paste0("Started at T1\nn = ", sum(patient_presence$first_timepoint == "T1")), "entry",
+  "t2_entry", 2.6, 0.50, paste0("Entered at T2\nn = ", sum(patient_presence$first_timepoint == "T2")), "entry",
+  "t3_entry", 2.6, 0.18, paste0("Entered at T3\nn = ", sum(patient_presence$first_timepoint == "T3")), "entry",
+  "t1_to_t2", 4.6, 0.82, paste0("T1 patients also at T2\nn = ", sum(patient_presence$T1 == 1L & patient_presence$T2 == 1L)), "follow",
+  "t1_to_t3", 6.5, 0.82, paste0("T1 patients also at T3\nn = ", sum(patient_presence$T1 == 1L & patient_presence$T3 == 1L)), "follow",
+  "t2_to_t3", 4.6, 0.50, paste0("T2 entrants also at T3\nn = ", sum(patient_presence$T1 == 0L & patient_presence$T2 == 1L & patient_presence$T3 == 1L)), "follow"
+)
+
+flow_edges <- tibble::tribble(
+  ~x, ~y, ~xend, ~yend,
+  1.35, 0.62, 2.05, 0.82,
+  1.35, 0.62, 2.05, 0.50,
+  1.35, 0.62, 2.05, 0.18,
+  3.15, 0.82, 4.05, 0.82,
+  5.10, 0.82, 5.95, 0.82,
+  3.15, 0.50, 4.05, 0.50
+)
+
+p_flow <- ggplot2::ggplot() +
+  ggplot2::geom_curve(
+    data = flow_edges,
+    ggplot2::aes(x = x, y = y, xend = xend, yend = yend),
+    curvature = 0,
+    linewidth = 0.6,
+    color = "grey35",
+    arrow = grid::arrow(length = grid::unit(0.18, "inches"), type = "closed")
+  ) +
+  ggplot2::geom_label(
+    data = flow_nodes,
+    ggplot2::aes(x = x, y = y, label = label, fill = fill_group),
+    linewidth = 0.25,
+    label.padding = grid::unit(0.2, "lines"),
+    size = 4,
+    lineheight = 0.95,
+    fontface = "bold"
+  ) +
+  ggplot2::scale_fill_manual(
+    values = c(
+      all = "#D9E6F2",
+      entry = "#F7D7C4",
+      follow = "#D8EBCF"
+    )
+  ) +
+  ggplot2::coord_cartesian(xlim = c(0, 7.2), ylim = c(0.05, 0.95), clip = "off") +
+  ggplot2::labs(
+    title = "Patient flow across annual timepoints",
+    subtitle = "Raw cohort entry and follow-up structure",
+    x = NULL,
+    y = NULL
+  ) +
+  ggplot2::theme_void() +
+  ggplot2::theme(
+    legend.position = "none",
+    plot.title = ggplot2::element_text(face = "bold", size = 15),
+    plot.subtitle = ggplot2::element_text(size = 11)
+  )
+
+ggplot2::ggsave(
+  filename = file.path(plot_dir, "patient_flowchart.png"),
+  plot = p_flow,
+  width = 11,
+  height = 5.5,
+  dpi = 300
+)
+
+first_visits <- data_long |>
+  dplyr::inner_join(entry_lookup, by = "patient_id") |>
+  dplyr::filter(as.character(timepoint) == first_timepoint)
+
+entry_characteristics <- tibble::tibble(
+  characteristic = c(
+    "Patients",
+    "% of unique cohort",
+    "Age, years",
+    "Female",
+    "HbA1c, %",
+    "BMI, kg/m^2",
+    "Waist circumference, cm",
+    "HDL, mg/dL",
+    "LDL, mg/dL",
+    "Triglyceride, mg/dL",
+    "Current smoking",
+    "Hypertension medication",
+    "Hyperlipidemia medication",
+    "Diabetes medication"
+  )
+)
+
+entry_groups <- c("T1", "T2", "T3")
+overall_n <- nrow(first_visits)
+
+for (group in entry_groups) {
+  df_group <- first_visits |>
+    dplyr::filter(first_timepoint == group)
+
+  n_group <- nrow(df_group)
+
+  entry_characteristics[[group]] <- c(
+    as.character(n_group),
+    sprintf("%.1f%%", 100 * n_group / overall_n),
+    fmt_mean_sd(df_group$age),
+    fmt_n_pct(df_group$sex, yes_label = "Female"),
+    fmt_mean_sd(df_group$hba1c, digits = 2),
+    fmt_mean_sd(df_group$bmi, digits = 1),
+    fmt_mean_sd(df_group$waist_circumference_cm, digits = 1),
+    fmt_mean_sd(df_group$hdl, digits = 1),
+    fmt_mean_sd(df_group$ldl, digits = 1),
+    fmt_median_iqr(df_group$triglyceride, digits = 1),
+    fmt_n_pct(df_group$smoking_status, yes_label = "Yes"),
+    fmt_n_pct(df_group$taking_medication_for_hypertenstion, yes_label = "Yes"),
+    fmt_n_pct(df_group$taking_medication_for_hyperlipidemia, yes_label = "Yes"),
+    fmt_n_pct(df_group$taking_medication_for_diabetes, yes_label = "Yes")
+  )
+}
+
+entry_characteristics$Overall <- c(
+  as.character(overall_n),
+  "100.0%",
+  fmt_mean_sd(first_visits$age),
+  fmt_n_pct(first_visits$sex, yes_label = "Female"),
+  fmt_mean_sd(first_visits$hba1c, digits = 2),
+  fmt_mean_sd(first_visits$bmi, digits = 1),
+  fmt_mean_sd(first_visits$waist_circumference_cm, digits = 1),
+  fmt_mean_sd(first_visits$hdl, digits = 1),
+  fmt_mean_sd(first_visits$ldl, digits = 1),
+  fmt_median_iqr(first_visits$triglyceride, digits = 1),
+  fmt_n_pct(first_visits$smoking_status, yes_label = "Yes"),
+  fmt_n_pct(first_visits$taking_medication_for_hypertenstion, yes_label = "Yes"),
+  fmt_n_pct(first_visits$taking_medication_for_hyperlipidemia, yes_label = "Yes"),
+  fmt_n_pct(first_visits$taking_medication_for_diabetes, yes_label = "Yes")
+)
+
+readr::write_csv(
+  entry_characteristics,
+  file.path(output_dir, "first_timepoint_clinical_characteristics.csv")
+)
+
+for (i in seq_len(nrow(behaviour_specs))) {
+  behaviour_name <- behaviour_specs$behaviour[[i]]
+  behaviour_label <- behaviour_specs$behaviour_label[[i]]
+
+  sankey_df <- data_long |>
+    dplyr::transmute(
+      patient_id,
+      timepoint,
+      category = .data[[behaviour_name]]
+    ) |>
+    dplyr::filter(!is.na(category)) |>
+    tidyr::pivot_wider(
+      names_from = timepoint,
+      values_from = category,
+      values_fn = dplyr::first
+    ) |>
+    tidyr::drop_na(T1, T2, T3) |>
+    dplyr::mutate(flow_id = dplyr::row_number())
+
+  if (nrow(sankey_df) == 0) {
+    next
+  }
+
+  readr::write_csv(
+    sankey_df |>
+      dplyr::count(T1, T2, T3, name = "n"),
+    file.path(output_dir, paste0("sankey_transition_table_", behaviour_name, ".csv"))
+  )
+
+  sankey_plot_data <- sankey_df |>
+    tidyr::pivot_longer(T1:T3, names_to = "timepoint", values_to = "category") |>
+    dplyr::mutate(timepoint = factor(timepoint, levels = c("T1", "T2", "T3")))
+
+  p_sankey <- ggplot2::ggplot(
+    sankey_plot_data,
+    ggplot2::aes(
+      x = timepoint,
+      stratum = category,
+      alluvium = flow_id,
+      fill = category,
+      label = category
+    )
+  ) +
+    ggalluvial::geom_flow(alpha = 0.35) +
+    ggalluvial::geom_stratum(alpha = 0.92, color = "grey30") +
+    ggplot2::geom_text(stat = "stratum", size = 3) +
+    ggplot2::scale_x_discrete(expand = c(0.08, 0.08)) +
+    ggplot2::labs(
+      title = paste("Behaviour transitions:", behaviour_label),
+      subtitle = "Patients with non-missing values at T1, T2, and T3",
+      x = NULL,
+      y = "Number of patients",
+      fill = NULL
+    ) +
+    ggplot2::theme(legend.position = "none")
+
+  ggplot2::ggsave(
+    filename = file.path(plot_dir, paste0("sankey_", behaviour_name, ".png")),
+    plot = p_sankey,
+    width = 10,
+    height = 6,
+    dpi = 300
+  )
+}
+
+build_pair_dataset <- function(data_long, entry_lookup, behaviour_name, behaviour_label, behaviour_type_value, from_tp, to_tp, transition_name) {
+  baseline_df <- data_long |>
+    dplyr::filter(timepoint == from_tp) |>
+    dplyr::left_join(entry_lookup, by = "patient_id") |>
+    dplyr::transmute(
+      patient_id,
+      entry_timepoint = first_timepoint,
+      age_from = age,
+      sex = sex,
+      smoking_status = smoking_status,
+      alcohol_drinking_category = alcohol_drinking_category,
+      exercise_more_than_30_minutes_category = exercise_more_than_30_minutes_category,
+      enough_sleep = enough_sleep,
+      taking_medication_for_hypertenstion = taking_medication_for_hypertenstion,
+      taking_medication_for_hyperlipidemia = taking_medication_for_hyperlipidemia,
+      taking_medication_for_diabetes = taking_medication_for_diabetes,
+      hba1c_from = hba1c,
+      bmi_from = bmi,
+      waist_from = waist_circumference_cm,
+      hdl_from = hdl,
+      ldl_from = ldl,
+      log_triglyceride_from = log_triglyceride,
+      behaviour_from = .data[[behaviour_name]]
+    )
+
+  followup_df <- data_long |>
+    dplyr::filter(timepoint == to_tp) |>
+    dplyr::transmute(
+      patient_id,
+      hba1c_to = hba1c,
+      bmi_to = bmi,
+      waist_to = waist_circumference_cm,
+      hdl_to = hdl,
+      ldl_to = ldl,
+      log_triglyceride_to = log_triglyceride,
+      behaviour_to = .data[[behaviour_name]]
+    )
+
+  baseline_df |>
+    dplyr::inner_join(followup_df, by = "patient_id") |>
+    dplyr::filter(!is.na(behaviour_from), !is.na(behaviour_to)) |>
+    dplyr::mutate(
+      transition = transition_name,
+      behaviour = behaviour_name,
+      behaviour_label = behaviour_label,
+      behaviour_type = behaviour_type_value,
+      exact_transition = paste(behaviour_from, "->", behaviour_to),
+      change_direction = classify_change(behaviour_from, behaviour_to, behaviour_type_value),
+      hba1c_change = hba1c_to - hba1c_from,
+      bmi_change = bmi_to - bmi_from,
+      waist_circumference_cm_change = waist_to - waist_from,
+      hdl_change = hdl_to - hdl_from,
+      ldl_change = ldl_to - ldl_from,
+      log_triglyceride_change = log_triglyceride_to - log_triglyceride_from
+    )
+}
+
+all_pair_data <- purrr::pmap_dfr(
+  tidyr::crossing(behaviour_specs, transition_pairs),
+  function(behaviour, behaviour_label, behaviour_type, from_tp, to_tp, transition) {
+    build_pair_dataset(
+      data_long = data_long,
+      entry_lookup = entry_lookup,
+      behaviour_name = behaviour,
+      behaviour_label = behaviour_label,
+      behaviour_type_value = behaviour_type,
+      from_tp = from_tp,
+      to_tp = to_tp,
+      transition_name = transition
+    )
+  }
+) |>
+  dplyr::mutate(
+    change_direction = factor(
+      change_direction,
+      levels = c("Improved behaviour", "No change", "Worsened behaviour")
+    ),
+    entry_timepoint = factor(entry_timepoint, levels = c("T1", "T2", "T3"))
+  )
+
+readr::write_csv(
+  all_pair_data,
+  file.path(output_dir, "patient_level_behaviour_transition_pairs.csv")
+)
+
+behaviour_transition_summary <- all_pair_data |>
+  dplyr::group_by(transition, behaviour, behaviour_label, exact_transition, change_direction) |>
+  dplyr::summarise(
+    n = dplyr::n(),
+    mean_hba1c_change = mean(hba1c_change, na.rm = TRUE),
+    mean_bmi_change = mean(bmi_change, na.rm = TRUE),
+    mean_waist_change = mean(waist_circumference_cm_change, na.rm = TRUE),
+    mean_hdl_change = mean(hdl_change, na.rm = TRUE),
+    mean_ldl_change = mean(ldl_change, na.rm = TRUE),
+    mean_log_triglyceride_change = mean(log_triglyceride_change, na.rm = TRUE),
+    .groups = "drop"
+  ) |>
+  dplyr::arrange(behaviour_label, transition, dplyr::desc(n))
+
+readr::write_csv(
+  behaviour_transition_summary,
+  file.path(output_dir, "behaviour_transition_summary.csv")
+)
+
+create_outcome_change_dataset <- function(pair_df, outcome_name, outcome_label) {
+  from_col <- if (outcome_name == "waist_circumference_cm") "waist_from" else paste0(outcome_name, "_from")
+  to_col <- if (outcome_name == "waist_circumference_cm") "waist_to" else paste0(outcome_name, "_to")
+  change_col <- paste0(outcome_name, "_change")
+
+  pair_df |>
+    dplyr::transmute(
+      patient_id,
+      entry_timepoint,
+      transition,
+      behaviour,
+      behaviour_label,
+      behaviour_from,
+      behaviour_to,
+      exact_transition,
+      change_direction,
+      age_from,
+      sex,
+      smoking_status,
+      alcohol_drinking_category,
+      exercise_more_than_30_minutes_category,
+      enough_sleep,
+      taking_medication_for_hypertenstion,
+      taking_medication_for_hyperlipidemia,
+      taking_medication_for_diabetes,
+      hba1c_from,
+      bmi_from,
+      waist_from,
+      hdl_from,
+      ldl_from,
+      log_triglyceride_from,
+      outcome = outcome_name,
+      outcome_label = outcome_label,
+      value_from = .data[[from_col]],
+      value_to = .data[[to_col]],
+      value_change = .data[[change_col]]
+    )
+}
+
+metabolic_change_data <- purrr::pmap_dfr(
+  outcome_specs,
+  function(outcome, outcome_label) {
+    create_outcome_change_dataset(
+      pair_df = all_pair_data,
+      outcome_name = outcome,
+      outcome_label = outcome_label
+    )
+  }
+)
+
+readr::write_csv(
+  metabolic_change_data,
+  file.path(output_dir, "patient_level_metabolic_change_data.csv")
+)
+
+metabolic_change_direction_summary <- metabolic_change_data |>
+  dplyr::group_by(outcome, outcome_label, transition, behaviour, behaviour_label, change_direction) |>
+  dplyr::summarise(
+    n = dplyr::n(),
+    mean_baseline = mean(value_from, na.rm = TRUE),
+    mean_followup = mean(value_to, na.rm = TRUE),
+    mean_change = mean(value_change, na.rm = TRUE),
+    sd_change = stats::sd(value_change, na.rm = TRUE),
+    .groups = "drop"
+  ) |>
+  dplyr::mutate(
+    se_change = sd_change / sqrt(n),
+    ci_low = mean_change - 1.96 * se_change,
+    ci_high = mean_change + 1.96 * se_change
+  ) |>
+  dplyr::arrange(outcome_label, behaviour_label, transition, change_direction)
+
+readr::write_csv(
+  metabolic_change_direction_summary,
+  file.path(output_dir, "metabolic_change_direction_summary.csv")
+)
+
+fit_outcome_change_model <- function(df, outcome_name) {
+  model_df <- df |>
+    dplyr::filter(
+      !is.na(value_change),
+      !is.na(change_direction),
+      !is.na(value_from),
+      !is.na(age_from),
+      !is.na(sex),
+      !is.na(smoking_status),
+      !is.na(alcohol_drinking_category),
+      !is.na(exercise_more_than_30_minutes_category),
+      !is.na(taking_medication_for_hypertenstion),
+      !is.na(taking_medication_for_hyperlipidemia),
+      !is.na(taking_medication_for_diabetes),
+      !is.na(entry_timepoint),
+      !is.na(hba1c_from)
+    ) |>
+    dplyr::mutate(
+      change_direction = stats::relevel(factor(change_direction), ref = "No change"),
+      entry_timepoint = factor(entry_timepoint, levels = c("T1", "T2", "T3"))
+    )
+
+  candidate_terms <- c(
+    "change_direction",
+    "value_from",
+    "age_from",
+    "sex",
+    "smoking_status",
+    "alcohol_drinking_category",
+    "exercise_more_than_30_minutes_category",
+    "taking_medication_for_hypertenstion",
+    "taking_medication_for_hyperlipidemia",
+    "taking_medication_for_diabetes",
+    "entry_timepoint"
+  )
+
+  if (outcome_name != "bmi") {
+    model_df <- model_df |>
+      dplyr::filter(!is.na(bmi_from))
+    candidate_terms <- c(candidate_terms, "bmi_from")
+  }
+
+  if (outcome_name != "hba1c") {
+    candidate_terms <- c(candidate_terms, "hba1c_from")
+  }
+
+  if (
+    nrow(model_df) < 80 ||
+    dplyr::n_distinct(model_df$change_direction) < 2 ||
+    !is.finite(stats::sd(model_df$value_change, na.rm = TRUE)) ||
+    stats::sd(model_df$value_change, na.rm = TRUE) == 0
+  ) {
+    return(NULL)
+  }
+
+  informative_terms <- candidate_terms[vapply(
+    candidate_terms,
+    function(term_name) {
+      values <- model_df[[term_name]]
+
+      if (is.factor(values) || is.character(values)) {
+        dplyr::n_distinct(stats::na.omit(values)) >= 2
+      } else {
+        sum(!is.na(values)) > 1 && stats::sd(values, na.rm = TRUE) > 0
+      }
+    },
+    logical(1)
+  )]
+
+  model_formula <- stats::as.formula(
+    paste("value_change ~", paste(informative_terms, collapse = " + "))
+  )
+
+  model <- stats::lm(model_formula, data = model_df)
+  robust_vcov <- sandwich::vcovHC(model, type = "HC3")
+  conf_tbl <- as.data.frame(lmtest::coefci(model, vcov. = robust_vcov)) |>
+    tibble::rownames_to_column("term") |>
+    tibble::as_tibble()
+
+  outcome_sd <- stats::sd(model_df$value_change, na.rm = TRUE)
+
+  broom::tidy(lmtest::coeftest(model, vcov. = robust_vcov)) |>
+    dplyr::left_join(conf_tbl, by = "term") |>
+    dplyr::rename(conf.low = `2.5 %`, conf.high = `97.5 %`) |>
+    dplyr::mutate(
+      n = stats::nobs(model),
+      outcome_change_sd = outcome_sd,
+      std_estimate = estimate / outcome_sd,
+      std_conf.low = conf.low / outcome_sd,
+      std_conf.high = conf.high / outcome_sd
+    )
+}
+
+metabolic_change_models <- metabolic_change_data |>
+  dplyr::group_by(outcome, outcome_label, transition, behaviour, behaviour_label) |>
+  tidyr::nest() |>
+  dplyr::mutate(model_results = purrr::map2(data, outcome, fit_outcome_change_model)) |>
+  dplyr::select(-data) |>
+  tidyr::unnest(model_results) |>
+  dplyr::filter(grepl("^change_direction", term)) |>
+  dplyr::mutate(
+    comparison = dplyr::recode(
+      term,
+      "change_directionImproved behaviour" = "Improved vs no change",
+      "change_directionWorsened behaviour" = "Worsened vs no change"
+    )
+  ) |>
+  dplyr::arrange(outcome_label, behaviour_label, transition, comparison)
+
+readr::write_csv(
+  metabolic_change_models,
+  file.path(output_dir, "metabolic_change_models.csv")
+)
+
+selected_results <- metabolic_change_models |>
+  dplyr::filter(
+    n >= 100,
+    !is.na(p.value)
+  ) |>
+  dplyr::arrange(p.value, dplyr::desc(abs(std_estimate)))
+
+readr::write_csv(
+  selected_results,
+  file.path(output_dir, "metabolic_change_models_ranked.csv")
+)
+
+forest_top_results <- selected_results
+
+if (sum(forest_top_results$p.value < 0.10, na.rm = TRUE) > 0) {
+  forest_top_results <- forest_top_results |>
+    dplyr::filter(p.value < 0.10) |>
+    dplyr::slice_head(n = 18)
+} else {
+  forest_top_results <- forest_top_results |>
+    dplyr::slice_head(n = 18)
+}
+
+forest_top_results <- forest_top_results |>
+  dplyr::mutate(
+    plot_label = paste0(
+      outcome_label,
+      " | ",
+      behaviour_label,
+      " | ",
+      gsub("_to_", "->", transition),
+      " | ",
+      comparison
+    ),
+    plot_label = forcats::fct_reorder(plot_label, std_estimate)
+  )
+
+readr::write_csv(
+  forest_top_results,
+  file.path(output_dir, "forest_top_results.csv")
+)
+
+p_forest <- ggplot2::ggplot(
+  forest_top_results,
+  ggplot2::aes(
+    x = std_estimate,
+    y = plot_label,
+    xmin = std_conf.low,
+    xmax = std_conf.high,
+    color = comparison
+  )
+) +
+  ggplot2::geom_vline(xintercept = 0, linetype = 2, color = "grey50") +
+  ggplot2::geom_pointrange(linewidth = 0.45) +
+  ggplot2::labs(
+    title = "Most relevant adjusted associations between behaviour change and metabolic change",
+    subtitle = "Standardized effect sizes from transition-specific HC3-robust linear models",
+    x = "Effect on outcome change (SD units)",
+    y = NULL,
+    color = NULL
+  ) +
+  ggplot2::theme(
+    legend.position = "bottom",
+    axis.text.y = ggplot2::element_text(size = 8)
+  )
+
+ggplot2::ggsave(
+  filename = file.path(plot_dir, "forest_top_results.png"),
+  plot = p_forest,
+  width = 13,
+  height = 9,
+  dpi = 300
+)
+
+direction_counts <- all_pair_data |>
+  dplyr::group_by(behaviour_label, transition, change_direction) |>
+  dplyr::summarise(n = dplyr::n(), .groups = "drop") |>
+  dplyr::group_by(behaviour_label, transition) |>
+  dplyr::mutate(pct = 100 * n / sum(n)) |>
+  dplyr::ungroup()
+
+significant_results <- metabolic_change_models |>
+  dplyr::filter(p.value < 0.05, n >= 100) |>
+  dplyr::mutate(
+    estimate = round(estimate, 3),
+    conf.low = round(conf.low, 3),
+    conf.high = round(conf.high, 3),
+    std_estimate = round(std_estimate, 3),
+    p.value = round(p.value, 4)
+  ) |>
+  dplyr::select(
+    outcome_label,
+    behaviour_label,
+    transition,
+    comparison,
+    estimate,
+    conf.low,
+    conf.high,
+    std_estimate,
+    p.value,
+    n
+  ) |>
+  dplyr::arrange(p.value)
+```
+
+# Results
+
+## Cohort Flow
+
+```{r flow-summary-table}
+patient_flow_summary |>
+  knitr::kable(caption = "Patient flow summary in the raw cohort.")
+```
+
+```{r fig-flow, echo=FALSE}
+p_flow
+```
+
+## Clinical Characteristics at First Observed Timepoint
+
+```{r entry-characteristics}
+entry_characteristics |>
+  knitr::kable(caption = "Clinical characteristics at the first observed visit for each patient.")
+```
+
+## Behaviour Transition Patterns
+
+The binary behaviours were highly stable across annual visits, with more than 80% to 90% of observations typically remaining unchanged. Quick eating was the most dynamic pattern: for example, no change accounted for only `r sprintf('%.1f', direction_counts$pct[direction_counts$behaviour_label == "Quick eating" & direction_counts$transition == "T2_to_T3" & direction_counts$change_direction == "No change"][1])`% of T2 to T3 quick-eating transitions, compared with `r sprintf('%.1f', direction_counts$pct[direction_counts$behaviour_label == "Skipping breakfast" & direction_counts$transition == "T2_to_T3" & direction_counts$change_direction == "No change"][1])`% for skipping breakfast.
+
+```{r fig-sankeys, fig.show='hold', out.width='49%', echo=FALSE}
+knitr::include_graphics(c(
+  file.path(plot_dir, "sankey_quick_eating_category.png"),
+  file.path(plot_dir, "sankey_eating_within_2_hr_before_bed_category.png"),
+  file.path(plot_dir, "sankey_midnight_snack_category.png"),
+  file.path(plot_dir, "sankey_skipping_breakfast_category.png")
+))
+```
+
+## Adjusted Behaviour-Change Models
+
+All outcome-change models adjusted for baseline outcome level, age, sex, smoking, alcohol drinking, exercise, medication use, entry timepoint, and baseline BMI and/or HbA1c when applicable. The strongest and most coherent findings were adiposity-related rather than glycaemia-related.
+
+```{r significant-results}
+significant_results |>
+  knitr::kable(caption = "Adjusted behaviour-change associations with p < 0.05 and model n >= 100.")
+```
+
+```{r fig-forest, echo=FALSE}
+p_forest
+```
+
+# Discussion
+
+Three points stand out. First, raw cohort structure matters here: more than one in four patients entered at T2 and more than one in five entered at T3, so a T1-only design does not describe the full dataset. Second, most behaviour variables were stable over time, but quick eating changed more often than the binary late-eating and breakfast measures. Third, the clearest adjusted signals were for BMI and waist circumference. Worsening breakfast skipping and worsening eating within two hours before bed were associated with adiposity gain, especially in later transitions.
+
+HbA1c signals were weaker and less consistent than the adiposity results. Several lipid findings reached nominal significance, but directions were mixed and should be treated as exploratory rather than confirmatory. That pattern suggests that on this time scale, some behaviour changes may register more readily in body composition than in HbA1c.
+
+## Limitations
+
+1. The dataset is observational, so causal inference is not warranted.
+2. Behaviour variables are self-reported and relatively coarse.
+3. Several lipid and HbA1c findings were directionally inconsistent, which argues for cautious interpretation.
+4. No multiplicity adjustment was applied across the many transition-outcome models.
+
+# Conclusion
+
+In this transition-focused re-analysis, behaviour change was more clearly associated with BMI and waist change than with HbA1c. The dataset also contains substantial T2 and T3 entry that should be acknowledged explicitly in both descriptive reporting and model interpretation.
